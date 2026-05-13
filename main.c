@@ -33,7 +33,7 @@ void ask_gemini(const char *prompt) {
     struct Response response = {0};
     response.data = malloc(1);
     response.size = 0;
-    char json[2048];
+    char json[24000];
     snprintf(json, sizeof(json),
         "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}",
         prompt);
@@ -87,8 +87,6 @@ void chat_gemini(const char *input) {
     snprintf(prompt, sizeof(prompt),
         "You are Jarvis, a helpful terminal assistant. Reply in plain text only, no markdown, no asterisks, no headers. Keep it short. User says: %s",
         input);
-
-    // same as ask_gemini but no "run it?" prompt
     CURL *curl;
     struct Response response = {0};
     response.data = malloc(1);
@@ -120,7 +118,6 @@ void chat_gemini(const char *input) {
 }
 
 void show_sysinfo() {
-
     FILE *f = fopen("/proc/meminfo", "r");
     long total = 0, available = 0;
     char key[64];
@@ -134,24 +131,22 @@ void show_sysinfo() {
     long used = (total - available) / 1024;
     long total_mb = total / 1024;
     printf(CYAN "RAM: %ldMB / %ldMB\n" RESET, used, total_mb);
-
     FILE *temp_file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
     if (temp_file) {
         int temp;
         fscanf(temp_file, "%d", &temp);
         fclose(temp_file);
         printf(CYAN "CPU Temp: %d°C\n" RESET, temp / 1000);
-
-    FILE *df = popen("df -h / | tail -1", "r");
-    if (df) {
-        char disk[256];
-        fgets(disk, sizeof(disk), df);
-        pclose(df);
-        char dev[64], size[16], used_d[16], avail[16], use[16], mount[64];
-        sscanf(disk, "%s %s %s %s %s %s", dev, size, used_d, avail, use, mount);
-        printf(CYAN "Disk: %s used / %s total (%s)\n" RESET, used_d, size, use);
-}
-}
+        FILE *df = popen("df -h / | tail -1", "r");
+        if (df) {
+            char disk[256];
+            fgets(disk, sizeof(disk), df);
+            pclose(df);
+            char dev[64], size[16], used_d[16], avail[16], use[16], mount[64];
+            sscanf(disk, "%s %s %s %s %s %s", dev, size, used_d, avail, use, mount);
+            printf(CYAN "Disk: %s used / %s total (%s)\n" RESET, used_d, size, use);
+        }
+    }
 }
 
 void show_weather() {
@@ -171,11 +166,21 @@ void show_weather() {
     }
 }
 
+void clean_str(char *dst, const char *src, int max) {
+    int j = 0;
+    for (int i = 0; src[i] && j < max-1; i++) {
+        if (src[i] == '"' || src[i] == '\\' || src[i] == '\n' || src[i] == '\r') {
+            dst[j++] = ' ';
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = 0;
+}
+
 int main() {
     startup_animation();
-
     show_sysinfo();
-
     srand(time(NULL));
 
     FILE *file = fopen("/home/teemo/.bash_history", "r");
@@ -184,94 +189,90 @@ int main() {
     char history[100][256];
     while (fgets(line, sizeof(line), file) != NULL) {
         strcpy(history[i % 100], line);
-        i++;}
+        i++;
+    }
     for (int j = 0; j < 10; j++) {
-    int slot = (i + j) % 10;
-    printf("%d: %s", j, history[slot]);
-}
+        int slot = (i + j) % 10;
+        printf("%d: %s", j, history[slot]);
+    }
 
     while (1) {
-    char input[256];
-    printf(CYAN "What can I do for you? > " RESET);
-    fgets(input, sizeof(input), stdin);
-    input[strcspn(input, "\n")] = 0;
+        char input[256];
+        printf(CYAN "What can I do for you? > " RESET);
+        fgets(input, sizeof(input), stdin);
+        input[strcspn(input, "\n")] = 0;
 
-    if (strcmp(input, "weather") == 0) {
-    show_weather();
-    continue;
-}
+        if (strcmp(input, "weather") == 0) {
+            show_weather();
+            continue;
+        }
 
-    if (strcmp(input, "close") == 0) {
-        char *goodbyes[] = {
-        "Have a nice day! \n",
-        "See you later! \n",
-        "Goodbye! Stay safe! \n",
-        "Cya! Don't forget to touch grass \n",
-        "Take care! \n",
-        "Farewell! \n",
-        "Until next time! \n",
-        "Goodbye! \n",
-        "See you next time! \n",
-        "Shutting down... \n"
-};
-    printf(GREEN "%s" RESET, goodbyes[rand() % 10]);
-    break;
-}
-
-    if (strcmp(input, "talk") == 0) {
-    printf(GREEN "Let's talk! (type 'back' to return)\n" RESET);
-    while (1) {
-        char talk_input[256];
-        printf(CYAN "You > " RESET);
-        fgets(talk_input, sizeof(talk_input), stdin);
-        talk_input[strcspn(talk_input, "\n")] = 0;
-        if (strcmp(talk_input, "back") == 0) {
-            printf(GREEN "Back to command mode!\n" RESET);
+        if (strcmp(input, "close") == 0) {
+            char *goodbyes[] = {
+                "Have a nice day!\n", "See you later!\n", "Goodbye! Stay safe!\n",
+                "Cya! Don't forget to touch grass\n", "Take care!\n",
+                "Farewell!\n", "Until next time!\n", "Goodbye!\n",
+                "See you next time!\n", "Shutting down...\n"
+            };
+            printf(GREEN "%s" RESET, goodbyes[rand() % 10]);
             break;
         }
-        chat_gemini(talk_input);
-    }
-    continue;
-}
 
-    if (strcmp(input, "help") == 0) {
-    printf(GREEN "Commands:\n" RESET);
-    printf(YELLOW "  weather" RESET " - show current weather\n");
-    printf(YELLOW "  talk" RESET "    - chat with Jarvis\n");
-    printf(YELLOW "  close" RESET "   - exit Jarvis\n");
-    printf(YELLOW "  help" RESET "    - show this menu\n");
-    continue;
-}
+        if (strcmp(input, "talk") == 0) {
+            printf(GREEN "Let's talk! (type 'back' to return)\n" RESET);
+            while (1) {
+                char talk_input[256];
+                printf(CYAN "You > " RESET);
+                fgets(talk_input, sizeof(talk_input), stdin);
+                talk_input[strcspn(talk_input, "\n")] = 0;
+                if (strcmp(talk_input, "back") == 0) {
+                    printf(GREEN "Back to command mode!\n" RESET);
+                    break;
+                }
+                chat_gemini(talk_input);
+            }
+            continue;
+        }
 
-    char shown[100][256];
-    int shown_count = 0;
-    for (int j = 0; j < 10; j++) {
-        if (strstr(history[j], input) != NULL) {
-            int already_shown = 0;
-            for (int k = 0; k < shown_count; k++) {
-                if (strstr(shown[k], history[j]) != NULL) {
-                    already_shown = 1;
+        if (strcmp(input, "help") == 0) {
+            printf(GREEN "Commands:\n" RESET);
+            printf(YELLOW "  weather" RESET " - show current weather\n");
+            printf(YELLOW "  talk" RESET "    - chat with Jarvis\n");
+            printf(YELLOW "  close" RESET "   - exit Jarvis\n");
+            printf(YELLOW "  help" RESET "    - show this menu\n");
+            continue;
+        }
+
+        char shown[100][256];
+        int shown_count = 0;
+        for (int j = 0; j < 10; j++) {
+            if (strstr(history[j], input) != NULL) {
+                int already_shown = 0;
+                for (int k = 0; k < shown_count; k++) {
+                    if (strstr(shown[k], history[j]) != NULL) {
+                        already_shown = 1;
+                    }
+                }
+                if (already_shown == 0) {
+                    printf(YELLOW "suggestion: %s" RESET, history[j]);
+                    strcpy(shown[shown_count], history[j]);
+                    shown_count++;
                 }
             }
-            if (already_shown == 0) {
-                printf(YELLOW "suggestion: %s" RESET, history[j]);
-                strcpy(shown[shown_count], history[j]);
-                shown_count++;
         }
-    }
-    }
-
 
         char context[20000] = "My recent bash commands: ";
-    for (int j = 0; j < 10; j++) {
-        strcat(context, history[j]);
-}
-
-    char full_prompt[24000];
-    snprintf(full_prompt, sizeof(full_prompt),
-        "%s\nSuggest ONE terminal command for: %s\nReply with ONLY the command.",
-        context, input);
-    ask_gemini(full_prompt);
-}
+        for (int j = 0; j < 100; j++) {
+            char cleaned[256];
+            clean_str(cleaned, history[j], 256);
+            strcat(context, cleaned);
+            strcat(context, " ");
+        }
+        char full_prompt[24000];
+        snprintf(full_prompt, sizeof(full_prompt),
+            "%s\nSuggest ONE terminal command for: %s\nReply with ONLY the command.",
+            context, input);
+        ask_gemini(full_prompt);
+    }
     return 0;
 }
