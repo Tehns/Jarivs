@@ -22,7 +22,7 @@
  *    cargo build 2>&1 | jarvis explain
  *    gcc foo.c 2>&1 | jarvis explain
  */
-
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
