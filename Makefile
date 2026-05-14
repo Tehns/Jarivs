@@ -12,14 +12,13 @@ $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LIBS)
 
 install: $(TARGET)
-	@echo "Installing to /usr/local/bin/$(TARGET)..."
+	@echo "Installing jarvis to /usr/local/bin..."
 	install -m 755 $(TARGET) /usr/local/bin/$(TARGET)
-	@echo "Done! Run: jarvis"
+	@echo "Done. Run: jarvis"
 
 uninstall:
-	@echo "Removing /usr/local/bin/$(TARGET)..."
 	rm -f /usr/local/bin/$(TARGET)
-	@echo "Done."
+	@echo "Uninstalled."
 
 clean:
 	rm -f $(TARGET)
