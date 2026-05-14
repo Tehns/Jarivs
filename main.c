@@ -9,7 +9,7 @@
  *  AI-powered terminal assistant for Linux
  *  https://github.com/Tehns/Jarvis
  */
-
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
