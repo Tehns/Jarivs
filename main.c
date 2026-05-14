@@ -183,7 +183,7 @@ int main() {
     show_sysinfo();
     srand(time(NULL));
 
-    FILE *file = fopen("/home/teemo/.bash_history", "r");
+    FILE *file = fopen("/home/your_user/.bash_history", "r");
     int i = 0;
     char line[256];
     char history[100][256];
