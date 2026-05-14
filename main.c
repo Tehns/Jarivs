@@ -22,7 +22,7 @@
  *    cargo build 2>&1 | jarvis explain
  *    gcc foo.c 2>&1 | jarvis explain
  */
-#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -262,6 +262,28 @@ static void json_esc(const char *src, char *dst, size_t max) {
     dst[j]='\0';
 }
 
+/* Strip <THINK>...</THINK> (or THINK\n...\n\n) reasoning blocks some models emit */
+static void strip_think(char *s) {
+    /* Form 1: <THINK>...</THINK> or <think>...</think> */
+    char *start;
+    while ((start = strcasestr(s, "<think>")) != NULL) {
+        char *end = strcasestr(start, "</think>");
+        if (!end) { *start = '\0'; break; }
+        end += 8; /* skip </think> */
+        while (*end == '\n' || *end == '\r') end++;
+        memmove(start, end, strlen(end) + 1);
+    }
+    /* Form 2: bare "THINK\n...\n\n" block at start */
+    if (strncmp(s, "THINK\n", 6) == 0) {
+        char *end = strstr(s + 6, "\n\n");
+        if (end) { end += 2; memmove(s, end, strlen(end) + 1); }
+        else { s[0] = '\0'; }
+    }
+    /* Trim leading whitespace/newlines left behind */
+    size_t lead = strspn(s, " \t\r\n");
+    if (lead) memmove(s, s + lead, strlen(s + lead) + 1);
+}
+
 static char *gemini_ask(const Config *cfg, const char *prompt) {
     char url[512]; snprintf(url, sizeof(url), GEMINI_URL, cfg->api_key);
     size_t plen = strlen(prompt);
@@ -275,6 +297,7 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
     char *t = extract_text(resp->data);
     char *result = t ? strdup(t) : NULL;
     free(resp->data); free(resp);
+    if (result) strip_think(result);
     return result;
 }
 
