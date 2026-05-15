@@ -15,6 +15,8 @@
  *    jarvis --help            print help
  *    jarvis explain           read stderr from stdin and explain it
  *    jarvis alias             scan history and suggest aliases
+ *    jarvis update            update jarvis to the latest version
+ *    jarvis watch <cmd>       run a command, explain errors live
  *    jarvis "find big files"  one-shot command suggestion
  *
  *  Pipe usage:
@@ -29,6 +31,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <curl/curl.h>
 
 /* ─── ANSI colors ─────────────────────────────────────────────────────────── */
@@ -43,7 +46,7 @@
 #define RESET   "\033[0m"
 
 /* ─── Constants ───────────────────────────────────────────────────────────── */
-#define VERSION         "2.1.0"
+#define VERSION         "2.2.0"
 #define MAX_HISTORY     200
 #define MAX_LINE        512
 #define MAX_PATH        1024
@@ -335,7 +338,23 @@ static void cmd_explain(const Config *cfg) {
     char *answer = gemini_ask(cfg, prompt);
     free(prompt); free(buf);
     if (!answer) return;
-    printf("%s\n\n", answer);
+
+    /* Color-coded: line 1 = red (problem), line 2 = green (fix), line 3 = dim (why) */
+    char *line = strtok(answer, "\n");
+    int   lnum = 0;
+    while (line) {
+        char *text = line;
+        while (*text==' '||*text=='\t') text++;
+        if (text[0]>='1'&&text[0]<='3'&&text[1]=='.') text+=2;
+        while (*text==' ') text++;
+        if (!text[0]) { line=strtok(NULL,"\n"); continue; }
+        if      (lnum==0) printf(RED   "  ✗ %s\n" RESET, text);
+        else if (lnum==1) printf(GREEN "  ✓ %s\n" RESET, text);
+        else              printf(DIM   "  i %s\n" RESET, text);
+        lnum++;
+        line = strtok(NULL, "\n");
+    }
+    printf("\n");
     free(answer);
 }
 
@@ -509,17 +528,119 @@ static void cmd_sysinfo(void) {
     printf("\n");
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+ * CMD: UPDATE  —  pull and reinstall latest from GitHub
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+static void cmd_update(void) {
+    printf(CYAN "── Updating Jarvis " RESET DIM "────────────────────────────\n" RESET);
+    printf(DIM  "  Running install script from GitHub...\n\n" RESET);
+    fflush(stdout);
+    int ret = system(
+        "curl -fsSL https://raw.githubusercontent.com/Tehns/Jarvis/main/install.sh | bash"
+    );
+    if (ret != 0)
+        printf(RED "Update failed. Check your internet connection.\n" RESET);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * CMD: WATCH  —  run a command, catch errors, explain them automatically
+ *   Usage: jarvis watch make
+ *          jarvis watch "cargo build --release"
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+static void cmd_watch(const Config *cfg, const char *cmd) {
+    if (!cmd || !cmd[0]) {
+        printf(YELLOW "Usage: jarvis watch <command>\n" RESET);
+        printf(YELLOW "  e.g: jarvis watch make\n\n" RESET);
+        return;
+    }
+
+    printf(CYAN "── Watching: " RESET BOLD "%s\n\n" RESET, cmd);
+    fflush(stdout);
+
+    /* Run the command, capture stderr+stdout into a temp file */
+    char tmpfile[MAX_PATH];
+    snprintf(tmpfile, sizeof(tmpfile), "/tmp/jarvis_watch_%d.log", (int)getpid());
+
+    char shell_cmd[MAX_LINE * 2];
+    snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1 | tee %s", cmd, tmpfile);
+
+    int ret = system(shell_cmd);
+
+    if (ret == 0) {
+        printf("\n" GREEN "✓ Command completed successfully.\n\n" RESET);
+        remove(tmpfile);
+        return;
+    }
+
+    /* Command failed — read the log and explain */
+    printf("\n" RED "✗ Command failed (exit %d). Asking Jarvis...\n\n" RESET, WEXITSTATUS(ret));
+    fflush(stdout);
+
+    FILE *f = fopen(tmpfile, "r");
+    if (!f) { printf(RED "Could not read command output.\n" RESET); return; }
+
+    char buf[EXPLAIN_MAX]; size_t total = 0; int c;
+    while ((c = fgetc(f)) != EOF && total < EXPLAIN_MAX - 1) buf[total++] = (char)c;
+    buf[total] = '\0';
+    fclose(f);
+    remove(tmpfile);
+
+    if (!total) { printf(YELLOW "No output captured.\n" RESET); return; }
+
+    const char *input = (total > 3000) ? buf + total - 3000 : buf;
+
+    size_t plen = strlen(input) * 2 + 512;
+    char *prompt = malloc(plen); if (!prompt) return;
+    snprintf(prompt, plen,
+        "You are a Linux expert. The command '%s' failed with this output:\n\n---\n%s\n---\n\n"
+        "Reply in plain text (no markdown, no asterisks, no bullet symbols):\n"
+        "1. What went wrong — one sentence.\n"
+        "2. The exact fix — the command or config change.\n"
+        "3. Why it happened — one sentence.\n"
+        "Be direct. Address root cause first.", cmd, input);
+
+    printf(CYAN "── Jarvis explains " RESET DIM "────────────────────────────\n\n" RESET);
+
+    char *answer = gemini_ask(cfg, prompt);
+    free(prompt);
+    if (!answer) return;
+
+    /* Color-coded output: line 1 = red (problem), line 2 = green (fix), line 3 = dim (why) */
+    char *line = strtok(answer, "\n");
+    int   lnum = 0;
+    while (line) {
+        /* Skip empty lines and numbered prefixes like "1." "2." "3." */
+        char *text = line;
+        while (*text == ' ' || *text == '\t') text++;
+        if (text[0] >= '1' && text[0] <= '3' && text[1] == '.') text += 2;
+        while (*text == ' ') text++;
+        if (!text[0]) { line = strtok(NULL, "\n"); continue; }
+
+        if      (lnum == 0) printf(RED    "  ✗ %s\n" RESET, text);
+        else if (lnum == 1) printf(GREEN  "  ✓ %s\n" RESET, text);
+        else                printf(DIM    "  i %s\n" RESET, text);
+        lnum++;
+        line = strtok(NULL, "\n");
+    }
+    printf("\n");
+    free(answer);
+}
+
 static void cmd_help(void) {
     printf(CYAN "── Commands " RESET DIM "───────────────────────────────────\n" RESET);
-    printf(YELLOW "  %-22s" RESET " ask Gemini for a command\n",     "<anything>");
-    printf(YELLOW "  %-22s" RESET " explain piped error output\n",   "explain");
-    printf(YELLOW "  %-22s" RESET " suggest aliases from history\n", "alias");
-    printf(YELLOW "  %-22s" RESET " weather for configured city\n",  "weather");
-    printf(YELLOW "  %-22s" RESET " weather for any city\n",         "weather [city]");
-    printf(YELLOW "  %-22s" RESET " system info\n",                  "sysinfo");
-    printf(YELLOW "  %-22s" RESET " chat with Jarvis\n",             "talk");
-    printf(YELLOW "  %-22s" RESET " this menu\n",                    "help");
-    printf(YELLOW "  %-22s" RESET " exit\n",                         "close / exit / q");
+    printf(YELLOW "  %-22s" RESET " ask Gemini for a command\n",          "<anything>");
+    printf(YELLOW "  %-22s" RESET " explain piped error output\n",        "explain");
+    printf(YELLOW "  %-22s" RESET " run cmd, auto-explain on failure\n",  "watch <cmd>");
+    printf(YELLOW "  %-22s" RESET " suggest aliases from history\n",      "alias");
+    printf(YELLOW "  %-22s" RESET " update to latest version\n",          "update");
+    printf(YELLOW "  %-22s" RESET " weather for configured city\n",       "weather");
+    printf(YELLOW "  %-22s" RESET " weather for any city\n",              "weather [city]");
+    printf(YELLOW "  %-22s" RESET " system info\n",                       "sysinfo");
+    printf(YELLOW "  %-22s" RESET " chat with Jarvis\n",                  "talk");
+    printf(YELLOW "  %-22s" RESET " this menu\n",                         "help");
+    printf(YELLOW "  %-22s" RESET " exit\n",                              "close / exit / q");
     printf(DIM "\n  Pipe usage:\n    make 2>&1 | jarvis explain\n    gcc foo.c 2>&1 | jarvis explain\n\n" RESET);
 }
 
@@ -542,7 +663,9 @@ static void print_usage(void) {
            "  jarvis --version           print version\n"
            "  jarvis --help              print this help\n"
            "  jarvis explain             read piped stderr and explain it\n"
+           "  jarvis watch <cmd>         run command, auto-explain on failure\n"
            "  jarvis alias               suggest aliases from shell history\n"
+           "  jarvis update              update to latest version\n"
            "  jarvis \"find big files\"    one-shot command suggestion\n"
            "\nPipe usage:\n"
            "  make 2>&1 | jarvis explain\n"
@@ -565,6 +688,21 @@ int main(int argc, char *argv[]) {
     /* ── Sub-commands ── */
     if (argc>=2) {
         Config cfg; int cfg_ok=config_init(&cfg);
+
+        if (!strcmp(argv[1],"update")) {
+            cmd_update(); return 0;
+        }
+
+        if (!strcmp(argv[1],"watch")) {
+            if (!cfg_ok) return 1;
+            /* Join argv[2..] as the command to watch */
+            char wcmd[MAX_LINE]={0};
+            for (int i=2;i<argc;i++) {
+                if (i>2) strncat(wcmd," ",sizeof(wcmd)-strlen(wcmd)-1);
+                strncat(wcmd,argv[i],sizeof(wcmd)-strlen(wcmd)-1);
+            }
+            cmd_watch(&cfg, wcmd); return 0;
+        }
 
         if (!strcmp(argv[1],"explain")) {
             if (!cfg_ok) return 1;
@@ -620,6 +758,11 @@ int main(int argc, char *argv[]) {
         if (!strcmp(input,"sysinfo")) { cmd_sysinfo();       continue; }
         if (!strcmp(input,"talk"))    { cmd_talk(&cfg);      continue; }
         if (!strcmp(input,"alias"))   { cmd_alias(&history); continue; }
+        if (!strcmp(input,"update"))  { cmd_update();        continue; }
+        if (!strncmp(input,"watch",5)) {
+            char *wcmd=input+5; while(*wcmd==' ') wcmd++;
+            cmd_watch(&cfg, wcmd); continue;
+        }
         if (!strcmp(input,"explain")) {
             printf(YELLOW "  Usage: your-command 2>&1 | jarvis explain\n\n" RESET); continue;
         }
