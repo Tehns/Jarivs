@@ -1,65 +1,152 @@
-# JARVIS — AI Terminal Assistant
+# JARVIS
 
-> A lightweight, AI-powered terminal assistant for Linux. Written in pure C. Zero bloat.
+> AI-powered terminal assistant for Linux. Written in pure C. Zero bloat.
 
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
 ![Language](https://img.shields.io/badge/language-C99-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-2.1.0-cyan)
-
----
-
-## The killer feature
-
-You run a command. It fails. Instead of googling the error:
-
-```bash
-make 2>&1 | jarvis explain
-```
-
-Jarvis reads the output, finds the root cause, and tells you exactly what to fix. Works with any tool.
-
-```
-── Jarvis is reading the error ────────────────
-
-What went wrong: the linker cannot find -lssl because OpenSSL is not installed.
-The exact fix: sudo pacman -S openssl  (or: sudo apt install libssl-dev)
-Why it happened: your Makefile links against OpenSSL but the library isn't on this system.
-```
-
----
-
-## Features
-
-| Command | What it does |
-|---|---|
-| `make 2>&1 \| jarvis explain` | Read piped error output and explain it |
-| `jarvis alias` | Scan your history, suggest ready-to-paste aliases |
-| `jarvis "find big files"` | One-shot AI command suggestion |
-| `jarvis` | Interactive mode |
-| `jarvis talk` | Full chat with Gemini, rolling context |
-| `jarvis weather [city]` | Current weather for any city |
-| `jarvis sysinfo` | RAM, CPU temp, disk, uptime |
-| `jarvis --version` | Print version |
-
-**Works with bash, zsh, and fish** — auto-detects your history file.
+![Version](https://img.shields.io/badge/version-2.2.0-cyan)
 
 ---
 
 ## Install
 
-**Dependencies:** `gcc`, `libcurl`
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tehns/Jarvis/main/install.sh | bash
+```
+
+Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com), add it to `~/.config/jarvis/config` and you're done.
+
+---
+
+## What it does
+
+### Explain any error — just pipe it
 
 ```bash
-# Arch Linux
-sudo pacman -S curl gcc
-
-# Debian/Ubuntu
-sudo apt install gcc libcurl4-openssl-dev
-
-# Fedora
-sudo dnf install gcc libcurl-devel
+make 2>&1 | jarvis explain
+gcc foo.c 2>&1 | jarvis explain
+cargo build 2>&1 | jarvis explain
+npm install 2>&1 | jarvis explain
+systemctl start nginx 2>&1 | jarvis explain
 ```
+
+Output:
+```
+── Jarvis is reading the error ────────────────
+
+  ✗ The linker cannot find -lssl because OpenSSL is not installed.
+  ✓ sudo pacman -S openssl
+  i Your Makefile links against OpenSSL but the library isn't present on this system.
+```
+
+### Watch a command — auto-explain on failure
+
+```bash
+jarvis watch make
+jarvis watch cargo build
+jarvis watch gcc foo.c
+```
+
+Runs the command live. If it fails, Jarvis automatically explains what went wrong and how to fix it. No extra steps.
+
+### Suggest aliases from your history
+
+```bash
+jarvis alias
+```
+
+```
+── Alias suggestions ──────────────────────────
+   Based on your 317 most recent unique commands.
+
+  alias git_rebase='git rebase -i HEAD~3'    # used 14x
+  alias dk_up='docker-compose up -d'         # used 11x
+  alias mk_install='sudo make install'        # used 9x
+
+  Paste into ~/.bashrc, then: source ~/.bashrc
+```
+
+Runs entirely locally — no API call needed.
+
+### Ask for any command
+
+```bash
+jarvis "find files modified in the last 24 hours"
+# Jarvis suggests: find . -mtime -1 -type f
+# Run it? (y/n) >
+```
+
+### Full chat mode
+
+```bash
+jarvis talk
+```
+
+Persistent conversation context. Type `back` to return to command mode.
+
+### Weather & system info
+
+```bash
+jarvis weather
+jarvis weather London
+jarvis sysinfo
+```
+
+### Update
+
+```bash
+jarvis update
+```
+
+---
+
+## Interactive mode
+
+```
+jarvis > find large log files
+jarvis > watch make
+jarvis > alias
+jarvis > weather Kyiv
+jarvis > talk
+jarvis > sysinfo
+jarvis > help
+jarvis > q
+```
+
+---
+
+## One-shot from terminal
+
+```bash
+jarvis "kill process on port 8080"
+jarvis watch "cargo build --release"
+jarvis explain < error.log
+```
+
+---
+
+## Config
+
+Location: `~/.config/jarvis/config`
+
+```ini
+api_key=YOUR_GEMINI_API_KEY
+city=Kharkiv
+history_path=/home/you/.bash_history
+```
+
+| Key | Description | Default |
+|---|---|---|
+| `api_key` | Google Gemini API key (free) | *(required)* |
+| `city` | Default city for weather | `Kharkiv` |
+| `history_path` | Shell history file | *(auto-detected)* |
+
+Supports **bash, zsh, and fish** — history is auto-detected.
+
+---
+
+## Build from source
 
 ```bash
 git clone https://github.com/Tehns/Jarvis.git
@@ -68,107 +155,22 @@ make
 sudo make install
 ```
 
-On first run, Jarvis creates `~/.config/jarvis/config`. Add your Gemini API key:
-
-```ini
-api_key=YOUR_GEMINI_API_KEY
-city=Kyiv
-history_path=/home/you/.bash_history   # auto-detected, usually fine
-```
-
-Get a **free** API key at [aistudio.google.com](https://aistudio.google.com).
-
----
-
-## Usage
-
-### Explain errors (pipe mode)
+**Dependencies:** `gcc`, `libcurl`
 
 ```bash
-make 2>&1 | jarvis explain
-cargo build 2>&1 | jarvis explain
-gcc foo.c 2>&1 | jarvis explain
-npm install 2>&1 | jarvis explain
-systemctl start nginx 2>&1 | jarvis explain
-```
-
-### Alias suggestions (local, no API needed)
-
-```bash
-jarvis alias
-```
-
-```
-── Alias suggestions ──────────────────────────
-   Based on your 187 most recent unique commands.
-
-  alias git_rebase='git rebase -i HEAD~3'    # used 14x
-  alias dk_up='docker-compose up -d'         # used 11x
-  alias py_venv='source .venv/bin/activate'  # used 8x
-
-  Paste into your ~/.bashrc or ~/.zshrc, then run:
-    source ~/.bashrc
-```
-
-### One-shot query
-
-```bash
-jarvis "compress this folder"
-# Jarvis suggests: tar -czf folder.tar.gz folder/
-# Run it? (y/n) >
-```
-
-### Interactive mode
-
-```
-JARVIS  v2.1.0
-────────────────────────────────────────────
-  Shell history: /home/you/.zsh_history (187 commands)
-
-── System Info ─────────────────────────────
-  RAM  : 4231MB / 16384MB (25%)
-  CPU  : 52°C
-  Disk : 42G used / 120G total (36%)
-  Up   : 2d 4h 31m
-
-jarvis > how do I kill a process on port 8080
-── Asking Gemini ──────────────────────────────
-  Jarvis suggests: fuser -k 8080/tcp
-  Run it? (y/n) >
+sudo pacman -S curl gcc    # Arch
+sudo apt install gcc libcurl4-openssl-dev    # Debian/Ubuntu
+sudo dnf install gcc libcurl-devel           # Fedora
 ```
 
 ---
 
-## Build
+## Why C?
 
-```bash
-make            # build ./jarvis
-make install    # install to /usr/local/bin
-make uninstall  # remove
-make clean      # remove binary
-```
-
----
-
-## Config reference
-
-Location: `~/.config/jarvis/config`
-
-| Key | Description | Default |
-|---|---|---|
-| `api_key` | Google Gemini API key | *(required)* |
-| `city` | Default city for weather | `Kharkiv` |
-| `history_path` | Path to shell history | *(auto-detected)* |
-
----
-
-## How it works
-
-- **Pure C99**, single `main.c`, only depends on `libcurl`
-- History is **deduplicated** before sending to Gemini — no wasted tokens
-- **Explain mode** feeds the last 3000 chars of stderr (the relevant part) to Gemini with a structured prompt
-- **Alias miner** runs entirely locally — no API call, instant results
-- Config lives in `~/.config/jarvis/config`, nothing hardcoded
+- Single binary, ~100KB
+- No runtime, no interpreter, no dependencies beyond libcurl
+- Works on any Linux — x86, ARM, i686
+- Starts instantly
 
 ---
 
