@@ -238,31 +238,68 @@ static void history_context(const History *h, char *buf, size_t max) {
  * GEMINI
  * ══════════════════════════════════════════════════════════════════════════════ */
 
+/* extract_text: heap-allocates result — caller must free(). Thread-safe. */
 static char *extract_text(const char *json) {
-    static char r[16384]; r[0]='\0';
     char *s = strstr(json, "\"text\": \""); if (!s) return NULL;
-    s += 9; int i=0;
-    while (*s && i<(int)sizeof(r)-1) {
-        if (*s=='\\'&&*(s+1)) { s++; switch(*s){ case 'n':r[i++]='\n';break; case 't':r[i++]='\t';break; case '"':r[i++]='"';break; case '\\':r[i++]='\\';break; default:r[i++]=*s; } }
-        else if (*s=='"') break;
-        else r[i++]=*s;
+    s += 9;
+
+    /* First pass: calculate output length */
+    size_t len = 0;
+    const char *p = s;
+    while (*p && *p != '"') {
+        if (*p == '\\' && *(p+1)) { p++; }
+        len++; p++;
+    }
+
+    char *r = malloc(len + 1); if (!r) return NULL;
+    int i = 0;
+    while (*s && *s != '"') {
+        if (*s == '\\' && *(s+1)) {
+            s++;
+            switch (*s) {
+                case 'n':  r[i++] = '\n'; break;
+                case 't':  r[i++] = '\t'; break;
+                case 'r':  r[i++] = '\r'; break;
+                case '"':  r[i++] = '"';  break;
+                case '\\': r[i++] = '\\'; break;
+                case 'u': {
+                    /* Basic \uXXXX — emit ? for non-ASCII, pass through ASCII */
+                    unsigned int cp = 0;
+                    if (sscanf(s+1, "%4x", &cp) == 1) {
+                        s += 4;
+                        r[i++] = (cp < 0x80) ? (char)cp : '?';
+                    } else {
+                        r[i++] = '?';
+                    }
+                    break;
+                }
+                default: r[i++] = *s; break;
+            }
+        } else {
+            r[i++] = *s;
+        }
         s++;
     }
-    r[i]='\0'; return r;
+    r[i] = '\0';
+    return r;
 }
 
 static void json_esc(const char *src, char *dst, size_t max) {
-    size_t j=0;
-    for (size_t i=0; src[i]&&j<max-2; i++) {
-        char c=src[i];
-        if      (c=='"')  { dst[j++]='\\'; dst[j++]='"';  }
-        else if (c=='\\') { dst[j++]='\\'; dst[j++]='\\'; }
-        else if (c=='\n') { dst[j++]='\\'; dst[j++]='n';  }
-        else if (c=='\r') { dst[j++]='\\'; dst[j++]='r';  }
-        else if (c=='\t') { dst[j++]='\\'; dst[j++]='t';  }
-        else              { dst[j++]=c; }
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j < max - 7; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if      (c == '"')  { dst[j++]='\\'; dst[j++]='"';  }
+        else if (c == '\\') { dst[j++]='\\'; dst[j++]='\\'; }
+        else if (c == '\n') { dst[j++]='\\'; dst[j++]='n';  }
+        else if (c == '\r') { dst[j++]='\\'; dst[j++]='r';  }
+        else if (c == '\t') { dst[j++]='\\'; dst[j++]='t';  }
+        else if (c < 0x20) {
+            /* Other control characters: \u00XX */
+            j += snprintf(dst+j, max-j, "\\u%04x", c);
+        }
+        else { dst[j++] = (char)c; }
     }
-    dst[j]='\0';
+    dst[j] = '\0';
 }
 
 /* Strip <THINK>...</THINK> (or THINK\n...\n\n) reasoning blocks some models emit */
@@ -297,8 +334,7 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
     free(esc);
     Response *resp = http_post(url, json); free(json);
     if (!resp) return NULL;
-    char *t = extract_text(resp->data);
-    char *result = t ? strdup(t) : NULL;
+    char *result = extract_text(resp->data);   /* heap-allocated, caller frees */
     free(resp->data); free(resp);
     if (result) strip_think(result);
     return result;
@@ -546,8 +582,35 @@ static void cmd_update(void) {
 /* ══════════════════════════════════════════════════════════════════════════════
  * CMD: WATCH  —  run a command, catch errors, explain them automatically
  *   Usage: jarvis watch make
- *          jarvis watch "cargo build --release"
+ *          jarvis watch gcc foo.c
+ *
+ *  Uses fork+execvp — no shell injection risk.
  * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Split a string into argv array for execvp. Returns argc, fills args[]. */
+static int split_args(const char *cmd, char **args, int max_args) {
+    static char buf[MAX_LINE];
+    strncpy(buf, cmd, MAX_LINE - 1);
+    int argc = 0;
+    char *p = buf;
+    while (*p && argc < max_args - 1) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        /* Handle quoted strings */
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
+            args[argc++] = p;
+            while (*p && *p != q) p++;
+            if (*p) *p++ = '\0';
+        } else {
+            args[argc++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0';
+        }
+    }
+    args[argc] = NULL;
+    return argc;
+}
 
 static void cmd_watch(const Config *cfg, const char *cmd) {
     if (!cmd || !cmd[0]) {
@@ -559,23 +622,51 @@ static void cmd_watch(const Config *cfg, const char *cmd) {
     printf(CYAN "── Watching: " RESET BOLD "%s\n\n" RESET, cmd);
     fflush(stdout);
 
-    /* Run the command, capture stderr+stdout into a temp file */
+    /* Build argv for execvp */
+    char *args[128];
+    split_args(cmd, args, 128);
+    if (!args[0]) { printf(RED "Empty command.\n" RESET); return; }
+
+    /* Temp file to capture output */
     char tmpfile[MAX_PATH];
     snprintf(tmpfile, sizeof(tmpfile), "/tmp/jarvis_watch_%d.log", (int)getpid());
 
-    char shell_cmd[MAX_LINE * 2];
-    snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1 | tee %s", cmd, tmpfile);
+    /* Open tee: pipe child stdout+stderr to both terminal and tmpfile */
+    char tee_cmd[MAX_PATH + 16];
+    snprintf(tee_cmd, sizeof(tee_cmd), "tee %s", tmpfile);
+    FILE *tee = popen(tee_cmd, "w");
+    if (!tee) { printf(RED "popen tee failed.\n" RESET); return; }
+    int tee_fd = fileno(tee);
 
-    int ret = system(shell_cmd);
+    /* Fork the watched command */
+    pid_t pid = fork();
+    if (pid < 0) { printf(RED "fork failed.\n" RESET); pclose(tee); return; }
 
-    if (ret == 0) {
+    if (pid == 0) {
+        /* Child: redirect stdout+stderr to tee */
+        dup2(tee_fd, STDOUT_FILENO);
+        dup2(tee_fd, STDERR_FILENO);
+        execvp(args[0], args);
+        /* execvp only returns on error */
+        fprintf(stderr, "jarvis: command not found: %s\n", args[0]);
+        _exit(127);
+    }
+
+    /* Parent: wait for child */
+    int status = 0;
+    waitpid(pid, &status, 0);
+    pclose(tee);
+
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+
+    if (exit_code == 0) {
         printf("\n" GREEN "✓ Command completed successfully.\n\n" RESET);
         remove(tmpfile);
         return;
     }
 
     /* Command failed — read the log and explain */
-    printf("\n" RED "✗ Command failed (exit %d). Asking Jarvis...\n\n" RESET, WEXITSTATUS(ret));
+    printf("\n" RED "✗ Command failed (exit %d). Asking Jarvis...\n\n" RESET, exit_code);
     fflush(stdout);
 
     FILE *f = fopen(tmpfile, "r");
@@ -607,20 +698,18 @@ static void cmd_watch(const Config *cfg, const char *cmd) {
     free(prompt);
     if (!answer) return;
 
-    /* Color-coded output: line 1 = red (problem), line 2 = green (fix), line 3 = dim (why) */
+    /* Color-coded: red = problem, green = fix, dim = why */
     char *line = strtok(answer, "\n");
     int   lnum = 0;
     while (line) {
-        /* Skip empty lines and numbered prefixes like "1." "2." "3." */
         char *text = line;
         while (*text == ' ' || *text == '\t') text++;
         if (text[0] >= '1' && text[0] <= '3' && text[1] == '.') text += 2;
         while (*text == ' ') text++;
         if (!text[0]) { line = strtok(NULL, "\n"); continue; }
-
-        if      (lnum == 0) printf(RED    "  ✗ %s\n" RESET, text);
-        else if (lnum == 1) printf(GREEN  "  ✓ %s\n" RESET, text);
-        else                printf(DIM    "  i %s\n" RESET, text);
+        if      (lnum == 0) printf(RED   "  ✗ %s\n" RESET, text);
+        else if (lnum == 1) printf(GREEN "  ✓ %s\n" RESET, text);
+        else                printf(DIM   "  i %s\n" RESET, text);
         lnum++;
         line = strtok(NULL, "\n");
     }
@@ -746,9 +835,19 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         printf(CYAN "jarvis" RESET DIM " > " RESET); fflush(stdout);
-        char input[512];
-        if (!fgets(input,sizeof(input),stdin)) break;
-        input[strcspn(input,"\n")]='\0';
+        char input[2048];
+        if (!fgets(input, sizeof(input), stdin)) break;
+
+        /* Detect truncation: if no newline found, the line was longer than our buffer */
+        if (!strchr(input, '\n') && !feof(stdin)) {
+            /* Drain the rest of the line */
+            int ch; while ((ch = fgetc(stdin)) != '\n' && ch != EOF);
+            printf(YELLOW "  Input too long (max %d chars), please shorten your query.\n\n" RESET,
+                   (int)sizeof(input) - 1);
+            continue;
+        }
+
+        input[strcspn(input,"\n")] = '\0';
         if (!input[0]) continue;
 
         if (!strcmp(input,"close")||!strcmp(input,"exit")||!strcmp(input,"q")) {
