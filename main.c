@@ -334,7 +334,23 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
     free(esc);
     Response *resp = http_post(url, json); free(json);
     if (!resp) return NULL;
-    char *result = extract_text(resp->data);   /* heap-allocated, caller frees */
+
+    /* Debug: JARVIS_DEBUG=1 jarvis explain — prints raw Gemini response */
+    if (getenv("JARVIS_DEBUG"))
+        fprintf(stderr, DIM "\n[debug] raw response:\n%.2000s\n\n" RESET, resp->data);
+
+    /* Try "text" field first, then fallback to "content" for older API responses */
+    char *result = extract_text(resp->data);
+    if (!result) {
+        /* Check for API error message */
+        char *err = strstr(resp->data, "\"message\":");
+        if (err) {
+            fprintf(stderr, RED "Gemini API error: %.200s\n" RESET, err);
+        } else {
+            fprintf(stderr, RED "Could not parse Gemini response.\n" RESET);
+            fprintf(stderr, DIM "Run with JARVIS_DEBUG=1 to see raw response.\n" RESET);
+        }
+    }
     free(resp->data); free(resp);
     if (result) strip_think(result);
     return result;
