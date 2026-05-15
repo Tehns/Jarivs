@@ -47,7 +47,7 @@
 
 /* ─── Constants ───────────────────────────────────────────────────────────── */
 #define VERSION         "2.2.0"
-#define MAX_HISTORY     200
+#define MAX_HISTORY     400
 #define MAX_LINE        512
 #define MAX_PATH        1024
 #define MAX_CONFIG_VAL  256
@@ -339,14 +339,24 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
     if (getenv("JARVIS_DEBUG"))
         fprintf(stderr, DIM "\n[debug] raw response:\n%.2000s\n\n" RESET, resp->data);
 
-    /* Try "text" field first, then fallback to "content" for older API responses */
+    /* Check for rate limit (429) specifically */
+    if (strstr(resp->data, "RESOURCE_EXHAUSTED") || strstr(resp->data, "429")) {
+        /* Try to extract retry delay */
+        char *retry = strstr(resp->data, "retryDelay\":\"");
+        int seconds = 60; /* default */
+        if (retry) sscanf(retry + 13, "%ds", &seconds);
+        fprintf(stderr, YELLOW "Rate limit reached (20 req/day on free tier).\n" RESET);
+        fprintf(stderr, YELLOW "Try again in %d seconds.\n" RESET, seconds);
+        free(resp->data); free(resp);
+        return NULL;
+    }
+
+    /* Try "text" field, report other API errors */
     char *result = extract_text(resp->data);
     if (!result) {
-        /* Check for API error message */
         char *err = strstr(resp->data, "\"message\":");
-        if (err) {
-            fprintf(stderr, RED "Gemini API error: %.200s\n" RESET, err);
-        } else {
+        if (err) fprintf(stderr, RED "Gemini API error: %.200s\n" RESET, err);
+        else {
             fprintf(stderr, RED "Could not parse Gemini response.\n" RESET);
             fprintf(stderr, DIM "Run with JARVIS_DEBUG=1 to see raw response.\n" RESET);
         }
