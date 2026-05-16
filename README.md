@@ -3,7 +3,7 @@
 > AI-powered terminal assistant for Linux. Written in pure C. Zero bloat.
 
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
-![Language](https://img.shields.io/badge/language-C99-lightgrey)
+![Language](https://img.shields.io/badge/language-C-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Version](https://img.shields.io/badge/version-2.2.0-cyan)
 
