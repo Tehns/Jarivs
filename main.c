@@ -587,7 +587,7 @@ static void cmd_talk(const Config *cfg) {
         if (first) {
             snprintf(prompt,sizeof(prompt),
                 "You are Jarvis, a sharp Linux terminal assistant. "
-                "Plain text only — no markdown, no asterisks. Be concise. User: %s", input);
+                "Plain text only - no markdown, no asterisks. Be concise. User: %s", input);
             first=0;
         } else {
             snprintf(prompt,sizeof(prompt),
