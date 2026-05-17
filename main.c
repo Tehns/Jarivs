@@ -24,6 +24,7 @@
  *    cargo build 2>&1 | jarvis explain
  *    gcc foo.c 2>&1 | jarvis explain
  */
+
 #define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <curl/curl.h>
@@ -61,6 +63,9 @@ typedef struct { char api_key[MAX_CONFIG_VAL]; char city[MAX_CONFIG_VAL]; char h
 typedef struct { char *data; size_t size; } Response;
 typedef struct { char cmds[MAX_HISTORY][MAX_LINE]; int count; } History;
 typedef struct { char cmd[MAX_LINE]; int count; } CmdFreq;
+
+/* ─── Forward declarations ────────────────────────────────────────────────── */
+static int split_args(char *working_buf, char **args, int max_args);
 
 /* ══════════════════════════════════════════════════════════════════════════════
  * HTTP
@@ -122,13 +127,20 @@ static Response *http_get(const char *url) {
  * CONFIG
  * ══════════════════════════════════════════════════════════════════════════════ */
 
+static const char *safe_home(void) {
+    const char *home = getenv("HOME");
+    if (home && home[0]) return home;
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir) return pw->pw_dir;
+    return "/tmp";
+}
+
 static void config_path(char *buf, size_t len) {
-    const char *home = getenv("HOME"); if (!home) home = "/root";
-    snprintf(buf, len, "%s/.config/jarvis/config", home);
+    snprintf(buf, len, "%s/.config/jarvis/config", safe_home());
 }
 
 static void detect_history(char *buf, size_t len) {
-    const char *home = getenv("HOME"); if (!home) home = "/root";
+    const char *home = safe_home();
     const char *hf = getenv("HISTFILE");
     if (hf && access(hf, R_OK) == 0) { strncpy(buf, hf, len-1); return; }
     const char *sh = getenv("SHELL");
@@ -170,8 +182,7 @@ static int config_init(Config *cfg) {
 
     if (!config_load(cfg)) {
         /* Create default config */
-        const char *home = getenv("HOME"); if (!home) home = "/root";
-        char dir[MAX_PATH]; snprintf(dir, sizeof(dir), "%s/.config/jarvis", home);
+        char dir[MAX_PATH]; snprintf(dir, sizeof(dir), "%s/.config/jarvis", safe_home());
         mkdir(dir, 0700);
         char path[MAX_PATH]; config_path(path, sizeof(path));
         FILE *f = fopen(path, "w");
@@ -200,26 +211,55 @@ static int config_init(Config *cfg) {
  * HISTORY
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-static void strip_fish(char *l) { if (!strncmp(l,"- cmd: ",7)) memmove(l,l+7,strlen(l+7)+1); }
+static void strip_fish(char *l) {
+    if (!strncmp(l, "- cmd: ", 7)) { memmove(l, l+7, strlen(l+7)+1); return; }
+    /* Suppress non-command fish history lines */
+    if (!strncmp(l, "- when: ", 8) || !strncmp(l, "  paths:", 8) ||
+        !strncmp(l, "  - ", 4)) { l[0] = '\0'; }
+}
 static void strip_zsh(char *l)  { if (l[0]==':'&&l[1]==' ') { char *s=strchr(l,';'); if(s) memmove(l,s+1,strlen(s+1)+1); } }
 
 static void history_load(History *h, const char *path) {
     h->count = 0;
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, RED "Cannot open history: %s\n" RESET, path); return; }
-    char all[MAX_HISTORY*4][MAX_LINE]; int total=0;
+
+    /* Seek to end and read last chunk — we want the most recent commands */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    long chunk = (fsize > 65536) ? 65536 : fsize; /* read last 64KB */
+    fseek(f, fsize - chunk, SEEK_SET);
+
+    /* Heap-allocate to avoid ~1.6MB stack usage */
+    typedef char HistLine[MAX_LINE];
+    HistLine *all  = malloc(sizeof(HistLine) * MAX_HISTORY*4);
+    HistLine *seen = malloc(sizeof(HistLine) * MAX_HISTORY*4);
+    if (!all || !seen) { free(all); free(seen); fclose(f); return; }
+
+    int total=0;
     char line[MAX_LINE];
-    while (fgets(line,sizeof(line),f) && total < MAX_HISTORY*4) {
-        line[strcspn(line,"\n")]='\0'; strip_fish(line); strip_zsh(line);
+
+    /* If we seeked mid-line, discard the partial first line */
+    if (fsize > chunk) fgets(line, sizeof(line), f);
+
+    /* No ceiling on total — we want all lines in the chunk so
+       the backwards traversal picks the most recent unique ones */
+    while (fgets(line, sizeof(line), f)) {
+        if (total >= MAX_HISTORY*4) break;
+        line[strcspn(line,"\n")] = '\0';
+        strip_fish(line);
+        strip_zsh(line);
         if (line[0]) strncpy(all[total++], line, MAX_LINE-1);
     }
     fclose(f);
-    char seen[MAX_HISTORY*4][MAX_LINE]; int sc=0;
+
+    int sc=0;
     for (int i=total-1; i>=0 && h->count<MAX_HISTORY; i--) {
         int dup=0;
         for (int j=0; j<sc; j++) if (!strcmp(seen[j],all[i])) { dup=1; break; }
         if (!dup) { strncpy(seen[sc++],all[i],MAX_LINE-1); strncpy(h->cmds[h->count++],all[i],MAX_LINE-1); }
     }
+    free(all); free(seen);
 }
 
 static void history_context(const History *h, char *buf, size_t max) {
@@ -263,7 +303,8 @@ static char *extract_text(const char *json) {
                 case '"':  r[i++] = '"';  break;
                 case '\\': r[i++] = '\\'; break;
                 case 'u': {
-                    /* \uXXXX — pass ASCII, replace non-ASCII with ? */
+                    /* \uXXXX: s is on 'u', need to skip u+4 hex = 5 total.
+                       main loop does s++ so we advance 4 here. */
                     unsigned int cp = 0;
                     if (sscanf(s+1, "%4x", &cp) == 1) {
                         s += 4;
@@ -294,8 +335,9 @@ static void json_esc(const char *src, char *dst, size_t max) {
         else if (c == '\r') { dst[j++]='\\'; dst[j++]='r';  }
         else if (c == '\t') { dst[j++]='\\'; dst[j++]='t';  }
         else if (c < 0x20) {
-            int w = snprintf(dst+j, max-j, "\\u%04x", c);
-            if (w > 0 && (size_t)w < max-j) j += w;
+            if (max - j < 7) break;
+            snprintf(dst+j, max-j, "\\u%04x", c);
+            j += 6; /* \uXXXX is always exactly 6 chars */
         }
         else { dst[j++] = (char)c; }
     }
@@ -327,10 +369,10 @@ static void strip_think(char *s) {
 static char *gemini_ask(const Config *cfg, const char *prompt) {
     char url[512]; snprintf(url, sizeof(url), GEMINI_URL, cfg->api_key);
     size_t plen = strlen(prompt);
-    char *esc = malloc(plen*2+4); if (!esc) return NULL;
-    json_esc(prompt, esc, plen*2+4);
+    char *esc = malloc(plen*6+4); if (!esc) return NULL;
+    json_esc(prompt, esc, plen*6+4);
     char *json = malloc(strlen(esc)+64); if (!json) { free(esc); return NULL; }
-    sprintf(json, "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}", esc);
+    snprintf(json, strlen(esc)+64, "{\"contents\":[{\"parts\":[{\"text\":\"%s\"}]}]}", esc);
     free(esc);
     Response *resp = http_post(url, json); free(json);
     if (!resp) return NULL;
@@ -371,13 +413,18 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
  * ══════════════════════════════════════════════════════════════════════════════ */
 
 static void cmd_explain(const Config *cfg) {
+    if (isatty(STDIN_FILENO)) {
+        printf(YELLOW "No piped input detected.\n" RESET);
+        printf(YELLOW "Usage: your-command 2>&1 | jarvis explain\n\n" RESET);
+        return;
+    }
     char *buf = malloc(EXPLAIN_MAX); if (!buf) return;
     size_t total=0; int c;
     while ((c=fgetc(stdin))!=EOF && total<EXPLAIN_MAX-1) buf[total++]=(char)c;
     buf[total]='\0';
 
     if (total==0) {
-        printf(YELLOW "No input. Usage: your-command 2>&1 | jarvis explain\n" RESET);
+        printf(YELLOW "No input captured.\n" RESET);
         free(buf); return;
     }
 
@@ -491,15 +538,34 @@ static void cmd_suggest(const Config *cfg, const History *h, const char *query) 
         ctx, query);
 
     char *answer = gemini_ask(cfg, prompt); if (!answer) return;
-    char *t=answer;
-    while (*t==' '||*t=='\n'||*t=='\t') t++;
-    char *e=t+strlen(t)-1;
-    while (e>t&&(*e==' '||*e=='\n'||*e=='\t')) *e--='\0';
+    char *t = answer;
+    while (*t == ' ' || *t == '\n' || *t == '\t') t++;
+    size_t tlen = strlen(t);
+    if (tlen == 0) { free(answer); return; }
+    char *e = t + tlen - 1;
+    while (e >= t && (*e == ' ' || *e == '\n' || *e == '\t')) { *e = '\0'; e--; }
+    if (!t[0]) { free(answer); return; }
 
     printf(BLUE BOLD "  Jarvis suggests: " RESET BOLD "%s\n" RESET, t);
     printf(CYAN "  Run it? (y/n) > " RESET);
     char ch[4];
-    if (fgets(ch,sizeof(ch),stdin)&&ch[0]=='y') system(t);
+    if (fgets(ch, sizeof(ch), stdin) && ch[0] == 'y') {
+        char working_buf[4096];
+        strncpy(working_buf, t, sizeof(working_buf) - 1);
+        working_buf[sizeof(working_buf) - 1] = '\0';
+        char *args[128];
+        split_args(working_buf, args, 128);
+        if (args[0]) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                execvp(args[0], args);
+                fprintf(stderr, "jarvis: command not found: %s\n", args[0]);
+                _exit(127);
+            } else if (pid > 0) {
+                int status; waitpid(pid, &status, 0);
+            }
+        }
+    }
     free(answer);
 }
 
@@ -530,9 +596,17 @@ static void cmd_talk(const Config *cfg) {
         }
         char *answer=gemini_ask(cfg,prompt); if (!answer) continue;
         printf(GREEN "Jarvis: " RESET "%s\n\n", answer);
-        size_t sl=strlen(session),al=strlen(answer),il=strlen(input);
-        if (sl+al+il+32<sizeof(session)-1)
-            snprintf(session+sl,sizeof(session)-sl,"User: %s\nJarvis: %s\n",input,answer);
+
+        /* Rolling session: keep dropping oldest exchanges until new one fits */
+        size_t exchange_len = strlen(input) + strlen(answer) + 32;
+        while (strlen(session) + exchange_len >= sizeof(session) - 1) {
+            char *next = strstr(session + 1, "User:");
+            if (next) memmove(session, next, strlen(next) + 1);
+            else { session[0] = '\0'; break; }
+        }
+        snprintf(session + strlen(session), sizeof(session) - strlen(session),
+                 "User: %s\nJarvis: %s\n", input, answer);
+
         free(answer);
     }
 }
@@ -594,13 +668,25 @@ static void cmd_sysinfo(void) {
 
 static void cmd_update(void) {
     printf(CYAN "── Updating Jarvis " RESET DIM "────────────────────────────\n" RESET);
-    printf(DIM  "  Running install script from GitHub...\n\n" RESET);
+    printf(DIM  "  Fetching latest from GitHub...\n\n" RESET);
     fflush(stdout);
-    int ret = system(
-        "curl -fsSL https://raw.githubusercontent.com/Tehns/Jarvis/main/install.sh | bash"
-    );
-    if (ret != 0)
-        printf(RED "Update failed. Check your internet connection.\n" RESET);
+
+    /* curl -fsSL <url> | bash — needs shell for the pipe, but URL is hardcoded */
+    char *args[] = { "bash", "-c",
+        "curl -fsSL https://raw.githubusercontent.com/Tehns/Jarvis/main/install.sh | bash",
+        NULL };
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp("bash", args);
+        fprintf(stderr, RED "bash not found\n" RESET);
+        _exit(1);
+    } else if (pid > 0) {
+        int status; waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            printf(RED "Update failed. Check your internet connection.\n" RESET);
+    } else {
+        printf(RED "fork failed.\n" RESET);
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -611,16 +697,14 @@ static void cmd_update(void) {
  *  Uses fork+execvp — no shell injection risk.
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/* Split a string into argv array for execvp. Returns argc, fills args[]. */
-static int split_args(const char *cmd, char **args, int max_args) {
-    static char buf[MAX_LINE];
-    strncpy(buf, cmd, MAX_LINE - 1);
+/* Split a string into argv for execvp. Modifies working_buf in place.
+   Caller must keep working_buf alive until execvp/waitpid completes. */
+static int split_args(char *working_buf, char **args, int max_args) {
     int argc = 0;
-    char *p = buf;
+    char *p = working_buf;
     while (*p && argc < max_args - 1) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
-        /* Handle quoted strings */
         if (*p == '"' || *p == '\'') {
             char q = *p++;
             args[argc++] = p;
@@ -646,9 +730,11 @@ static void cmd_watch(const Config *cfg, const char *cmd) {
     printf(CYAN "── Watching: " RESET BOLD "%s\n\n" RESET, cmd);
     fflush(stdout);
 
-    /* Build argv for execvp */
+    char working_buf[4096];
+    strncpy(working_buf, cmd, sizeof(working_buf) - 1);
+    working_buf[sizeof(working_buf) - 1] = '\0';
     char *args[128];
-    split_args(cmd, args, 128);
+    split_args(working_buf, args, 128);
     if (!args[0]) { printf(RED "Empty command.\n" RESET); return; }
 
     char tmpfile[MAX_PATH];
