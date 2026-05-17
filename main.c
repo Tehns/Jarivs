@@ -30,6 +30,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <curl/curl.h>
@@ -213,7 +214,7 @@ static void history_load(History *h, const char *path) {
         if (line[0]) strncpy(all[total++], line, MAX_LINE-1);
     }
     fclose(f);
-    char seen[MAX_HISTORY][MAX_LINE]; int sc=0;
+    char seen[MAX_HISTORY*4][MAX_LINE]; int sc=0;
     for (int i=total-1; i>=0 && h->count<MAX_HISTORY; i--) {
         int dup=0;
         for (int j=0; j<sc; j++) if (!strcmp(seen[j],all[i])) { dup=1; break; }
@@ -238,12 +239,11 @@ static void history_context(const History *h, char *buf, size_t max) {
  * GEMINI
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/* extract_text: heap-allocates result — caller must free(). Thread-safe. */
+/* extract_text: heap-allocates result — caller must free() */
 static char *extract_text(const char *json) {
     char *s = strstr(json, "\"text\": \""); if (!s) return NULL;
     s += 9;
 
-    /* First pass: calculate output length */
     size_t len = 0;
     const char *p = s;
     while (*p && *p != '"') {
@@ -263,7 +263,7 @@ static char *extract_text(const char *json) {
                 case '"':  r[i++] = '"';  break;
                 case '\\': r[i++] = '\\'; break;
                 case 'u': {
-                    /* Basic \uXXXX — emit ? for non-ASCII, pass through ASCII */
+                    /* \uXXXX — pass ASCII, replace non-ASCII with ? */
                     unsigned int cp = 0;
                     if (sscanf(s+1, "%4x", &cp) == 1) {
                         s += 4;
@@ -294,8 +294,8 @@ static void json_esc(const char *src, char *dst, size_t max) {
         else if (c == '\r') { dst[j++]='\\'; dst[j++]='r';  }
         else if (c == '\t') { dst[j++]='\\'; dst[j++]='t';  }
         else if (c < 0x20) {
-            /* Other control characters: \u00XX */
-            j += snprintf(dst+j, max-j, "\\u%04x", c);
+            int w = snprintf(dst+j, max-j, "\\u%04x", c);
+            if (w > 0 && (size_t)w < max-j) j += w;
         }
         else { dst[j++] = (char)c; }
     }
@@ -351,7 +351,6 @@ static char *gemini_ask(const Config *cfg, const char *prompt) {
         return NULL;
     }
 
-    /* Try "text" field, report other API errors */
     char *result = extract_text(resp->data);
     if (!result) {
         char *err = strstr(resp->data, "\"message\":");
@@ -382,7 +381,7 @@ static void cmd_explain(const Config *cfg) {
         free(buf); return;
     }
 
-    /* Feed last 3000 chars — the tail is almost always the relevant error */
+    /* last 3000 chars — tail is almost always the relevant error */
     const char *input = (total>3000) ? buf+total-3000 : buf;
 
     printf(CYAN "── Jarvis is reading the error " RESET DIM "────────────────\n\n" RESET);
@@ -401,7 +400,6 @@ static void cmd_explain(const Config *cfg) {
     free(prompt); free(buf);
     if (!answer) return;
 
-    /* Color-coded: line 1 = red (problem), line 2 = green (fix), line 3 = dim (why) */
     char *line = strtok(answer, "\n");
     int   lnum = 0;
     while (line) {
@@ -484,7 +482,7 @@ static void cmd_suggest(const Config *cfg, const History *h, const char *query) 
     printf(CYAN "── Asking Gemini " RESET DIM "──────────────────────────────\n" RESET);
 
     char ctx[4096]; history_context(h, ctx, sizeof(ctx));
-    char prompt[6000];
+    char prompt[8192];
     snprintf(prompt, sizeof(prompt),
         "You are a Linux terminal expert. "
         "The user's recent shell history (most recent first):\n%s\n"
@@ -653,35 +651,45 @@ static void cmd_watch(const Config *cfg, const char *cmd) {
     split_args(cmd, args, 128);
     if (!args[0]) { printf(RED "Empty command.\n" RESET); return; }
 
-    /* Temp file to capture output */
     char tmpfile[MAX_PATH];
     snprintf(tmpfile, sizeof(tmpfile), "/tmp/jarvis_watch_%d.log", (int)getpid());
 
-    /* Open tee: pipe child stdout+stderr to both terminal and tmpfile */
-    char tee_cmd[MAX_PATH + 16];
-    snprintf(tee_cmd, sizeof(tee_cmd), "tee %s", tmpfile);
-    FILE *tee = popen(tee_cmd, "w");
-    if (!tee) { printf(RED "popen tee failed.\n" RESET); return; }
-    int tee_fd = fileno(tee);
+    /* Open log file for writing captured output */
+    int logfd = open(tmpfile, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    if (logfd < 0) { printf(RED "Cannot create temp file.\n" RESET); return; }
 
-    /* Fork the watched command */
-    pid_t pid = fork();
-    if (pid < 0) { printf(RED "fork failed.\n" RESET); pclose(tee); return; }
+    /* pipe: child writes to pipefd[1], parent reads from pipefd[0] and tees to terminal+logfd */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { close(logfd); printf(RED "pipe failed.\n" RESET); return; }
 
-    if (pid == 0) {
-        /* Child: redirect stdout+stderr to tee */
-        dup2(tee_fd, STDOUT_FILENO);
-        dup2(tee_fd, STDERR_FILENO);
+    pid_t child = fork();
+    if (child < 0) { close(logfd); close(pipefd[0]); close(pipefd[1]); printf(RED "fork failed.\n" RESET); return; }
+
+    if (child == 0) {
+        /* child: stdout+stderr -> pipe write end */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        close(logfd);
         execvp(args[0], args);
-        /* execvp only returns on error */
         fprintf(stderr, "jarvis: command not found: %s\n", args[0]);
         _exit(127);
     }
 
-    /* Parent: wait for child */
+    /* parent: read from pipe, write to terminal and logfile simultaneously */
+    close(pipefd[1]);
+    char rbuf[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], rbuf, sizeof(rbuf))) > 0) {
+        write(STDOUT_FILENO, rbuf, n);   /* terminal */
+        write(logfd, rbuf, n);           /* log file */
+    }
+    close(pipefd[0]);
+    close(logfd);
+
     int status = 0;
-    waitpid(pid, &status, 0);
-    pclose(tee);
+    waitpid(child, &status, 0);
 
     int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 
